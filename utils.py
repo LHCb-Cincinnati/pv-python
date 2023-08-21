@@ -832,3 +832,839 @@ class Model(nn.Module):
         y_prime = torch.sum(x1,dim=1)        
         y_pred = torch.mul(y_prime,0.001)
         return y_pred
+    
+#     ----     # dervied from efficiency_res_optimized.py
+## and "simplified" to provide some methods that can be used
+## to examine 1-D, 4000-bin numpy arrays for single events, not
+## batches of events
+
+
+import numba
+import numpy as np
+from typing import NamedTuple
+from collections import Counter
+from math import sqrt as sqrt
+
+#####################################################################################
+def pv_locations_updated_res(
+    targets,
+    threshold,
+    integral_threshold,
+    min_width
+):
+    """
+    Compute the z positions from the input KDE using the parsed criteria.
+    
+    Inputs:
+      * targets: 
+          Numpy array of KDE values (predicted or true)
+
+      * threshold: 
+          The threshold for considering an "on" value - such as 1e-2
+
+      * integral_threshold: 
+          The total integral required to trigger a hit - such as 0.2
+
+      * min_width: 
+          The minimum width (in bins) of a feature - such as 2
+
+    Returns:
+      * array of float32 values corresponding to the PV z positions
+      
+    """
+    # Counter of "active bins" i.e. with values above input threshold value
+    state = 0
+    # Sum of active bin values
+    integral = 0.0
+    # Weighted Sum of active bin values weighted by the bin location
+    sum_weights_locs = 0.0
+
+    # Make an empty array and manually track the size (faster than python array)
+    items = np.empty(150, np.float32)
+    # Number of recorded PVs
+    nitems = 0
+
+    # Account for special case where two close PV merge KDE so that
+    # targets[i] never goes below the threshold before the two PVs are scanned through
+    peak_passed = False
+    local_peak_value = 0.0
+    
+    # Loop over the bins in the KDE histogram
+    for i in range(len(targets)):
+        # If bin value above 'threshold', then trigger
+        if targets[i] >= threshold:
+            state += 1
+            integral += targets[i]
+            sum_weights_locs += i * targets[i]  # weight times location
+
+## added 220916 mds
+            if (targets[i]>local_peak_value):
+                local_peak_value = targets[i]
+                local_peak_index = i
+## -------------------------------------
+
+## modified 220916
+## the goal to to continue to separaate true PVs correctly while not 
+## splitting wide predicted peaks that really correspond to a single PV
+##            if targets[i-1]>targets[i]:
+            if ((targets[i-1]>targets[i]+0.05) and (targets[i-1]>1.1*targets[i])):
+                peak_passed = True
+            
+        if (targets[i] < threshold or i == len(targets) - 1 or (targets[i-1]<targets[i] and peak_passed)) and state > 0:
+            #if (targets[i] < threshold or i == len(targets) - 1) and state > 0:
+
+            # Record a PV only if 
+            if state >= min_width and integral >= integral_threshold:
+                # Adding '+0.5' to account for the bin width (i.e. 50 microns)
+                items[nitems] = (sum_weights_locs / integral) + 0.5 
+                nitems += 1
+
+            # reset state
+            state = 0
+            integral = 0.0
+            sum_weights_locs = 0.0
+            peak_passed=False
+##  added 220916
+            local_peak_value = 0.0
+            
+
+    # Special case for final item (very rare or never occuring)
+    # handled by above if len
+
+    return items[:nitems]
+#####################################################################################
+
+def pv_locations_res(
+    targets,
+    threshold,
+    integral_threshold,
+    min_width
+):
+    """
+    Compute the z positions from the input KDE using the parsed criteria.
+    
+    Inputs:
+      * targets: 
+          Numpy array of KDE values (predicted or true)
+
+      * threshold: 
+          The threshold for considering an "on" value - such as 1e-2
+
+      * integral_threshold: 
+          The total integral required to trigger a hit - such as 0.2
+
+      * min_width: 
+          The minimum width (in bins) of a feature - such as 2
+
+    Returns:
+      * array of float32 values corresponding to the PV z positions
+      
+    """
+    # Counter of "active bins" i.e. with values above input threshold value
+    state = 0
+    # Sum of active bin values
+    integral = 0.0
+    # Weighted Sum of active bin values weighted by the bin location
+    sum_weights_locs = 0.0
+
+    # Make an empty array and manually track the size (faster than python array)
+    items = np.empty(150, np.float32)
+    # Number of recorded PVs
+    nitems = 0
+
+    # Loop over the bins in the KDE histogram
+    for i in range(len(targets)):
+        # If bin value above 'threshold', then trigger
+        if targets[i] >= threshold:
+            state += 1
+            integral += targets[i]
+            sum_weights_locs += i * targets[i]  # weight times location
+
+        if (targets[i] < threshold or i == len(targets) - 1) and state > 0:
+
+            # Record a PV only if 
+            if state >= min_width and integral >= integral_threshold:
+                # Adding '+0.5' to account for the bin width (i.e. 50 microns)
+                items[nitems] = (sum_weights_locs / integral) + 0.5 
+                nitems += 1
+
+            # reset state
+            state = 0
+            integral = 0.0
+            sum_weights_locs = 0.0
+
+    # Special case for final item (very rare or never occuring)
+    # handled by above if len
+
+    return items[:nitems]
+#####################################################################################
+
+def filter_nans_res(
+    items,
+    mask
+):
+    """
+    Method to mask bins in the predicted KDE array if the corresponding bin in the true KDE array is 'nan'.
+    
+    Inputs:
+      * items: 
+          Numpy array of predicted PV z positions
+
+      * mask: 
+          Numpy array of KDE values (true PVs)
+
+
+    Returns:
+      * Numpy array of predicted PV z positions
+      
+    """
+    # Create empty array with shape array of predicted PV z positions
+    retval = np.empty_like(items)
+    # Counter of 
+    max_index = 0
+    # Loop over the predicted PV z positions
+    for item in items:
+        index = int(round(item))
+        not_valid = np.isnan(mask[index])
+        if not not_valid:
+            retval[max_index] = item
+            max_index += 1
+
+    return retval[:max_index]
+#####################################################################################
+
+def remove_ghosts_PVs(
+    pred_PVs_loc,
+    predict,
+    z_diff_ghosts,
+    h_diff_ghosts, 
+    debug
+):
+    
+    """
+    Return the list or pred_PVs_loc after ghosts being removed based on two variables:
+         
+         - z_diff_ghosts (in number of bins): 
+              
+             2 predicted PVs that are close by each other (less than z_diff_ghosts) 
+
+         - h_diff_ghosts: 
+          
+             AND where one hist signal is significantly higher than the other (h_diff_ghosts)
+            
+    Inputs:
+      * pred_PVs_loc: 
+          Numpy array of computed z positions of the predicted PVs (using KDEs)
+
+      * predict: 
+          Numpy array of predictions
+
+      * z_diff_ghosts: 
+          Window in which one of 2 predicted PVs could be removed
+          
+      * h_diff_ghosts: 
+          Difference threshold in KDE max values between the two predicted PVs to decide 
+          if the smallest needs to be removed 
+
+      * debug: 
+          flag to print output for debugging purposes
+
+
+    Ouputs: 
+        Numpy array of filtered predicted PVs z position.
+    """
+
+    if debug:
+        print("pred_PVs_loc",pred_PVs_loc)
+    
+    # List of PVs to be removed at the end (index from pred_PVs_loc)
+    l_removed_ipvs=[]
+
+    # Only consider the case with at least 2 PVs
+    if len(pred_PVs_loc)>1:
+        
+        # Loop over the predicted PVs z location in bin number
+        for PV_index in range(len(pred_PVs_loc)-1):
+            
+            if debug:
+                print("Looking at PV index",PV_index)
+                
+            if PV_index in l_removed_ipvs:
+                # The considered PV has already been removed
+                if debug:
+                    print("Considered PV index",PV_index)
+                    print("already removed. Do nothing..")
+                
+                continue
+                    
+
+            # Get the centered bin number of the considered predicted PV
+            pred_PV_loc_ibin = int(pred_PVs_loc[PV_index])
+
+            # Get the max KDE of this 
+            pred_PV_max = predict[pred_PV_loc_ibin]
+
+            # Get the next predicted PV bin (centered on the max)
+            next_pred_PV_loc_ibin = int(pred_PVs_loc[PV_index+1])
+         
+            # Now get the actual closest matched PV max and max ibin
+            next_pred_PV_max = predict[next_pred_PV_loc_ibin]
+            next_pred_PV_max_ibin = next_pred_PV_loc_ibin
+
+            # Check if real max isn't actually the next or previous bin in the KDE hist
+            for ibin in range(next_pred_PV_loc_ibin-1,next_pred_PV_loc_ibin+1):
+                if predict[ibin] > next_pred_PV_max:
+                    next_pred_PV_max = predict[ibin]
+                    next_pred_PV_loc_ibin = ibin
+
+            if debug:
+                print("pred_PV_loc_ibin",pred_PV_loc_ibin)
+                print("pred_PV_max",pred_PV_max)
+                print("next_pred_PV_loc_ibin",next_pred_PV_loc_ibin)
+                print("next_pred_PV_max",next_pred_PV_max)
+                
+                print("Delta between PVs",abs(next_pred_PV_loc_ibin-pred_PV_loc_ibin))
+                    
+            # Check if the next predicted PV is in the region to be considered as a ghosts
+            if abs(next_pred_PV_loc_ibin-pred_PV_loc_ibin)<z_diff_ghosts:
+
+                # Compute the ratio of the closest_pred_PV_max over the pred_PV_max
+                r_max = 0
+                if not pred_PV_max==0:
+                    r_max=next_pred_PV_max/pred_PV_max
+
+                if debug:
+                    print("r_max",r_max)
+                    print("h_diff_ghosts",h_diff_ghosts)
+                    if abs(h_diff_ghosts)>0:
+                        print("1./h_diff_ghosts",1./h_diff_ghosts)
+                    
+                # If the ratio is above the high threshold (h_diff_ghosts)
+                # then tag the predicted PV with the "smallest" hist max as to be removed 
+                if r_max>h_diff_ghosts:
+                    l_removed_ipvs.append(PV_index)
+                    if debug:
+                        print("adding PV with index",PV_index)
+                        print(" to the list of PVs to be removed")
+                if abs(h_diff_ghosts)>0 and r_max<(1./h_diff_ghosts):
+                    l_removed_ipvs.append(PV_index+1)
+                    if debug:
+                        print("adding PV with index",(PV_index+1))
+                        print(" to the list of PVs to be removed")
+                
+    # Initally set the array of PVs to be returned (after ghosts removal) 
+    # as equal to the input array of reconstructed PVs
+    filtered_pred_PVs_loc = pred_PVs_loc
+    
+    # then loop over the list of indexes of PVs in the input array that needs to be removed
+    # and remove them from the array of PVs to be returned
+    for ipv in l_removed_ipvs:
+        filtered_pred_PVs_loc = np.delete(filtered_pred_PVs_loc,[ipv])
+    
+    return filtered_pred_PVs_loc
+#####################################################################################
+
+def get_std_resolution(
+    pred_PVs_loc,
+    predict,
+    nsig_res_std,
+    f_ratio_window,
+    nbins_lookup,
+    debug
+):
+
+    reco_std = np.empty_like(pred_PVs_loc)
+
+    max_bin = len(predict)-1
+    
+    for i_pred_PVs in range(len(pred_PVs_loc)):
+        
+        # First check whether the bin with the maxKDE is actually the one reported in pred_PVs_loc, 
+        # as it is already a weighted value. Just check previous abd next bins
+        pred_PV_loc_ibin = int(pred_PVs_loc[i_pred_PVs])
+        if predict[pred_PV_loc_ibin-1]>predict[pred_PV_loc_ibin]:
+            pred_PV_loc_ibin = pred_PV_loc_ibin-1
+            if debug:
+                print("Actual maximum shift to previous bin")
+        if predict[pred_PV_loc_ibin+1]>predict[pred_PV_loc_ibin]:
+            pred_PV_loc_ibin = pred_PV_loc_ibin+1
+            if debug:
+                print("Actual maximum shift to next bin")
+
+        bins = []
+        weights = []
+        sum_bin_prod_weights = 0
+        sum_weights = 0
+
+        maxKDE = predict[pred_PV_loc_ibin]
+        maxKDE_ratio = f_ratio_window*maxKDE
+        if debug:
+            print("maxKDE",maxKDE)
+            print("bin(maxKDE)",pred_PV_loc_ibin)
+
+        # Start by adding the values for the bin where KDE is maximum:
+        bins.append(pred_PV_loc_ibin)
+        weights.append(maxKDE)
+        sum_bin_prod_weights += pred_PV_loc_ibin*maxKDE
+        sum_weights += maxKDE
+        
+        # Now scan the "left side" (lower bin values) of the peak and add values to compute the KDE hist std value 
+        # if the predicted hist is higher than f_ratio_window*maxKDE 
+        # -- OR --
+        # if predict[ibin]>predict[ibin+1] which means there is another peak on the "left" of the considered one...
+        for ibin in range(pred_PV_loc_ibin-1,pred_PV_loc_ibin-nbins_lookup,-1):
+            if debug:
+                print("ibin",ibin)
+            if predict[ibin]<maxKDE_ratio or predict[ibin]>predict[ibin+1] or ibin==0:
+                if debug:
+                    print("before",ibin,predict[ibin])
+                    if predict[ibin]>predict[ibin+1]:
+                        print("predict[ibin]>predict[ibin+1]::ibin,predict[ibin],predict[ibin+1]", ibin,predict[ibin],predict[ibin+1])
+                    print("break")
+                break
+            else:
+                if debug:
+                    print("inside window",ibin,predict[ibin])
+                bins.append(ibin)
+                weights.append(predict[ibin])
+                sum_bin_prod_weights += ibin*predict[ibin]
+                sum_weights += predict[ibin]
+                
+        # Finally scan the "right side" (higher bin values) of the peak and add values to compute the KDE hist std value 
+        # if the predicted hist is higher than f_ratio_window*maxKDE 
+        # -- OR --
+        # if predict[ibin]>predict[ibin-1] which means there is another peak on the "right" of the considered one...
+        for ibin in range(pred_PV_loc_ibin+1,pred_PV_loc_ibin+nbins_lookup):
+            if debug:
+                print("ibin",ibin)
+            if predict[ibin]<maxKDE_ratio or predict[ibin]>predict[ibin-1] or ibin==max_bin:
+                if debug:
+                    print("after",ibin,predict[ibin])
+                    if predict[ibin]>predict[ibin-1]:
+                        print("predict[ibin]>predict[ibin-1]::ibin,predict[ibin-1],predict[ibin]",ibin,predict[ibin-1],predict[ibin])
+                    
+                    print("break")
+                break
+            else:
+                if debug:
+                    print("inside window",ibin,predict[ibin])
+                bins.append(ibin)
+                weights.append(predict[ibin])
+                sum_bin_prod_weights += ibin*predict[ibin]
+                sum_weights += predict[ibin]
+
+        mean = sum_bin_prod_weights/sum_weights
+        
+        #mean = sum(weights*bins)/sum(weights)
+        if debug:
+            print("weighted mean =",mean)
+        #computed_mean[i_pred_PVs] = mean
+        
+        sum_diff_sq_prod_w = 0
+        for i in range(len(bins)):
+            #delta_sq.append((bins[i]-mean)*(bins[i]-mean)*weights[i])
+            sum_diff_sq_prod_w += (bins[i]-mean)*(bins[i]-mean)*weights[i]
+                    
+        std = sqrt(sum_diff_sq_prod_w/sum_weights)        
+
+        reco_std[i_pred_PVs] = nsig_res_std*std
+    
+    return reco_std
+#####################################################################################
+
+def get_reco_resolution(
+    pred_PVs_loc,
+    predict,
+    nsig_res,
+    steps_extrapolation,
+    ratio_max,
+    debug
+):
+    """
+    Compute the resolution as a function of predicted KDE histogram 
+
+    Inputs:
+      * pred_PVs_loc: 
+          Numpy array of computed z positions of the predicted PVs (using KDEs)
+
+      * predict: 
+          Numpy array of predictions
+
+      * nsig_res: 
+          Empirical value representing the number of sigma wrt to the std resolution 
+          as a function of FHWM
+
+      * threshold: 
+          The threshold for considering an "on" value - such as 1e-2
+
+      * integral_threshold: 
+          The total integral required to trigger a hit - such as 0.2
+
+      * min_width: 
+          The minimum width (in bins) of a feature - such as 2
+
+      * debug: 
+          flag to print output for debugging purposes
+
+
+    Ouputs: 
+        Numpy array of filtered and sorted (in z values) expected resolution on the reco PVs z position.
+    """
+    
+    #    # Get the z position from the predicted KDEs distribution
+    #    predict_values = pv_locations_updated_res(predict, threshold, integral_threshold, min_width)
+
+    
+    # # Using the filter_nans_res method to 'mask' the bins in 'predict_values' 
+    # # where the corresponding bins in truth are 'nan' 
+    # filtered_predict_values = filter_nans_res(predict_values, truth)
+
+##  mds 220917
+##  target histograms have nan values to indicate masking
+##  numpy.nan_to_num converts these to zeros (with default argumnets)
+##  see https://numpy.org/doc/stable/reference/generated/numpy.nan_to_num.html for details
+    predict = np.nan_to_num(predict)
+    reco_reso = np.empty_like(pred_PVs_loc)
+
+##  add the following 220918 as after more than 1600 events 
+##  the code using this method ran into what appears to
+##  a nan value for rms; not sue how this happens, but
+##  giving it an initial value may resolve the problem.
+    rms = 1./sqrt(12.)
+
+    steps = steps_extrapolation
+    
+    i_predict_pv=0
+        
+    if steps==0:
+
+        # This is for the case where we do not extrapolate values in between bins
+        for predict_pv in pred_PVs_loc:
+            predict_pv_ibin = int(predict_pv)
+            predict_pv_KDE_max = predict[predict_pv_ibin]
+
+            FHWM = ratio_max*predict_pv_KDE_max
+
+            ibin_min = -1
+            ibin_max = -1
+
+            for ibin in range(predict_pv_ibin,predict_pv_ibin-20,-1):
+                predict_pv_KDE_val = predict[ibin]
+                if predict_pv_KDE_val<FHWM:
+                    ibin_min = ibin
+                    break
+
+            for ibin in range(predict_pv_ibin,predict_pv_ibin+20):
+                predict_pv_KDE_val = predict[ibin]
+                if predict_pv_KDE_val<FHWM:
+                    ibin_max = ibin
+                    break
+
+            FHWM_w = (ibin_max-ibin_min)
+            if(debug): 
+                print("FHWM_w",FHWM_w)
+            stantdard_dev = FHWM_w/2.335
+            reco_reso[i_predict_pv] = nsig_res*stantdard_dev
+            i_predict_pv+=1
+                
+    else:
+
+        if (debug):
+            print(" pred_PVs_loc = ",pred_PVs_loc)        
+        for predict_pv in pred_PVs_loc:
+            predict_pv_ibin = int(predict_pv)
+            predict_pv_KDE_max = predict[predict_pv_ibin]
+
+            FHWM = ratio_max*predict_pv_KDE_max
+
+            if (debug):
+                print(" ***** ")
+                print(" step != 0 ")
+                print(" predict_pv,  predict_pv_ibin,  predict_pv_KDE_max = ",
+                        predict_pv,  predict_pv_ibin,  predict_pv_KDE_max)
+
+            ibin_min_extrapol = -1
+            ibin_max_extrapol = -1
+            found_min = False
+            found_max = False
+            for ibin in range(predict_pv_ibin,predict_pv_ibin-20,-1):
+                if not found_min:
+                    predict_pv_KDE_val_ibin = predict[ibin]
+                    predict_pv_KDE_val_prev = predict[ibin-1]
+
+                    # Apply a dummy linear extrapolation between the two neigbour bins values 
+                    delta_steps = (predict_pv_KDE_val_prev - predict_pv_KDE_val_ibin)/steps
+                    for sub_bin in range(int(steps)):
+                        predict_pv_KDE_val_ibin -= delta_steps*sub_bin
+
+                        if predict_pv_KDE_val_ibin<FHWM:
+                            ibin_min_extrapol = int(ibin*steps-sub_bin)/steps
+                            found_min=True
+
+            for ibin in range(predict_pv_ibin,predict_pv_ibin+20):
+                if not found_max:
+                    predict_pv_KDE_val_ibin = predict[ibin]
+                    predict_pv_KDE_val_next = predict[ibin+1]
+
+                    # Apply a dummy linear extrapolation between the two neigbour bins values 
+                    delta_steps = (predict_pv_KDE_val_ibin - predict_pv_KDE_val_next)/steps
+                    for sub_bin in range(int(steps)):
+                        predict_pv_KDE_val_ibin -= delta_steps*sub_bin
+
+                        if predict_pv_KDE_val_ibin<FHWM:
+                            ibin_max_extrapol = (ibin*steps+sub_bin)/steps
+                            found_max=True
+                sumsq = 0.
+                sumContents = 0.
+                if (found_min and found_max):
+                  for index in range (int(ibin_min_extrapol),int(ibin_max_extrapol)+1):
+                    contents = predict[index]
+                    if (debug):
+                      print("index, contents = ",index,contents)
+                    sumsq += (index+0.5-predict_pv)*(index+0.5-predict_pv)*contents
+                    sumContents += contents
+                    if (debug):
+                      print("index+0.05, predict_pv, contents, sumsq, sumContents = ",
+                             index+0.05, predict_pv, contents, sumsq, sumContents)
+                  rms = sumsq/sumContents
+                  if (debug):
+                      print("rms = {:0.2f}".format(rms))
+                  if (debug):
+                     print("rms = {:0.2f}".format(rms))
+                     print("  ")
+
+
+            if ( debug and (not (found_min and found_max)) ):
+              print(" not (found_min and found_max) ")
+            FHWM_w = (ibin_max_extrapol-ibin_min_extrapol)
+            if (debug):
+                print("FHWM_w",FHWM_w)
+            stantdard_dev = FHWM_w/2.335
+            reco_reso[i_predict_pv] = nsig_res*stantdard_dev
+            reco_reso[i_predict_pv] = nsig_res*rms
+            i_predict_pv+=1
+        
+    return reco_reso
+#####################################################################################
+
+def get_resolution(
+    target_PVs_loc,
+    true_PVs_nTracks,
+    true_PVs_z,
+    nsig_res,
+    min_res,
+    debug
+):
+    
+    """
+    Compute the resolution as a function of true_PVs_nTracks
+
+    Inputs:
+      * target_PVs_loc: 
+          Numpy array of computed z positions of the true PVs (using KDEs)
+
+      * true_PVs_nTracks: 
+          Numpy array with the number of tracks originating from the true PV 
+          Ordered from the generator level (random in z)
+
+      * true_PVs_z: 
+          Numpy array with the z position of the true PVs (from generator).
+          Ordered from the generator level (random in z) 
+          It is necessary when computing the resolution (association between 
+          the correct true PV and the corresponding number of tracks)
+
+      * nsig_res: 
+          Empirical value representing the number of sigma wrt to the std resolution 
+          as a function of true_PVs_nTracks - such as 5
+
+      * min_res: 
+          Minimal resolution value (in terms of bins) for the search window - such as 3
+
+      * debug: 
+          flag to print output for debugging purposes
+
+
+    Ouputs: 
+        Numpy array of filtered (nTracks>4) and sorted (in z values) expected resolution on the true PVs z position.
+    """
+    
+    # First get the number of tracks for true PVs with true_PVs_nTracks > 4, 
+    # and sorted in ascending z value position:
+    #filtered_and_sorted_true_PVs_nTracks = np.empty(len(true_PVs_z[true_PVs_nTracks > 4]), np.float32)
+    filtered_and_sorted_true_PVs_nTracks = [i[1] for i in sorted( zip((true_PVs_z[true_PVs_nTracks > 4]), true_PVs_nTracks[true_PVs_nTracks > 4]))]
+
+    if debug:
+        print("Sorted number of tracks (get_resolution): ",filtered_and_sorted_true_PVs_nTracks)
+
+    # then compute the resolution using the following constants 
+    # used in calculating pvRes from Ref LHCb-PUB-2017-005 (original values in microns)
+    A_res = 926.0
+    B_res = 0.84
+    C_res = 10.7
+
+    ## scaling factor to changes units
+    scale = 0.01 # This scale allows a correct conversion from the target histograms of 4000 bins of width 100 microns and used elsewhere in the code. 
+    #scale = 1.0 #microns
+    #scale = 0.001 #mm
+
+    filtered_and_sorted_res = np.empty_like(target_PVs_loc)
+    
+    for i in range(len(filtered_and_sorted_true_PVs_nTracks)):
+        filtered_and_sorted_res[i] = nsig_res * ( scale * (A_res * np.power(filtered_and_sorted_true_PVs_nTracks[i], -1 * B_res) + C_res))
+    #filtered_and_sorted_res = (nsig_res*0.01* (A_res * np.power(filtered_and_sorted_true_PVs_nTracks, -1.0 * B_res) + C_res))
+
+    # Replace resolution values below min_res by min_res itself
+    filtered_and_sorted_res = np.where(filtered_and_sorted_res < min_res, min_res, filtered_and_sorted_res)
+    
+    return filtered_and_sorted_res
+#####################################################################################
+
+def compare_res_reco(
+    target_PVs_loc,
+    pred_PVs_loc,
+    reco_res,
+    debug
+):
+    """
+    Method to compute the efficiency counters: 
+    - succeed    = number of successfully predicted PVs
+    - missed     = number of missed true PVs
+    - false_pos  = number of predicted PVs not matching any true PVs
+
+    Inputs argument:
+      * target_PVs_loc: 
+          Numpy array of computed z positions of the true PVs (computed from target histograms)
+
+      * pred_PVs_loc: 
+          Numpy array of computed z positions of the predicted PVs (computed from predicted histograms)
+
+      * reco_res: 
+          Numpy array with the "reco" resolution computed from predicted histograms
+
+      * debug: 
+          flag to print output for debugging purposes
+    
+    
+    Returns:
+        succeed, missed, false_pos
+    """
+    
+    # Counters that will be iterated and returned by this method
+    succeed = 0
+    missed = 0
+    false_pos = 0
+        
+    # Get the number of predicted PVs
+    len_pred_PVs_loc = len(pred_PVs_loc)
+    # Get the number of true PVs 
+    len_target_PVs_loc = len(target_PVs_loc)
+
+    # Decide whether we have predicted equally or more PVs than trully present
+    # this is important, because the logic for counting the MT an FP depend on this
+    if len_pred_PVs_loc >= len_target_PVs_loc:
+        if debug:
+            print("In len(pred_PVs_loc) >= len(target_PVs_loc)")
+
+        # Since we have N(pred_PVs) >= N(true_PVs), 
+        # we loop over the pred_PVs, and check each one of them to decide 
+        # whether they should be labelled as S, FP. 
+        # The number of MT is computed as: N(true_PVs) - S
+        # Here the number of iteration is fixed to the original number of predicted PVs
+        for i in range(len_pred_PVs_loc):
+            if debug:
+                print("pred_PVs_loc = ",pred_PVs_loc[i])
+            # flag to check if the predicted PV is being matched to a true PV
+            matched = 0
+
+            # Get the window of interest: [min_val, max_val] 
+            # The window is obtained from the value of z of the true PV 'j'
+            # +/- the resolution as a function of the number of tracks for the true PV 'j'
+            min_val = pred_PVs_loc[i]-reco_res[i]
+            max_val = pred_PVs_loc[i]+reco_res[i]
+            if debug:
+                print("resolution = ",(max_val-min_val)/2.)
+                print("min_val = ",min_val)
+                print("max_val = ",max_val)
+
+            # Now looping over the true PVs.
+            for j in range(len(target_PVs_loc)):
+                # If condition is met, then the predicted PV is labelled as 'matched', 
+                # and the number of success is incremented by 1
+                if min_val <= target_PVs_loc[j] and target_PVs_loc[j] <= max_val:
+                    matched = 1
+                    succeed += 1
+                    if debug:
+                        print("succeed = ",succeed)
+                    # the true PV is removed from the original array to avoid associating 
+                    # one predicted PV to multiple true PVs
+                    # (this could happen for PVs with close z values)
+                    target_PVs_loc = np.delete(target_PVs_loc,[j])
+                    # Since a predicted PV and a true PV where matched, go to the next predicted PV 'i'
+                    break
+            # In case, no true PV could be associated with the predicted PV 'i'
+            # then it is assigned as a FP answer
+            if not matched:                
+                false_pos +=1
+                if debug:
+                    print("false_pos = ",false_pos)
+        # the number of missed true PVs is simply the difference between the original 
+        # number of true PVs and the number of successfully matched true PVs
+        missed = (len_target_PVs_loc-succeed)
+        if debug:
+            print("missed = ",missed)
+
+    else:
+        if debug:
+            print("In len(pred_PVs_loc) < len(target_PVs_loc)")
+        # Since we have N(pred_PVs) < N(true_PVs), 
+        # we loop over the true_PVs, and check each one of them to decide 
+        # whether they should be labelled as S, MT. 
+        # The number of FP is computed as: N(pred_PVs) - S
+        # Here the number of iteration is fixed to the original number of true PVs
+        for i in range(len_target_PVs_loc):
+            if debug:
+                print("target_PVs_loc = ",target_PVs_loc[i])
+            # flag to check if the true PV is being matched to a predicted PV
+            matched = 0
+            # Now looping over the predicted PVs.
+            for j in range(len(pred_PVs_loc)):                
+                # Get the window of interest: [min_val, max_val] 
+                # The window is obtained from the value of z of the true PV 'i'
+                # +/- the resolution as a function of the number of tracks for the true PV 'i'
+                min_val = pred_PVs_loc[j]-reco_res[j]
+                max_val = pred_PVs_loc[j]+reco_res[j]
+                if debug:
+                    print("pred_PVs_loc = ",pred_PVs_loc[j])
+                    print("resolution = ",(max_val-min_val)/2.)
+                    print("min_val = ",min_val)
+                    print("max_val = ",max_val)
+                # If condition is met, then the true PV is labelled as 'matched', 
+                # and the number of success is incremented by 1
+                if min_val <= target_PVs_loc[i] and target_PVs_loc[i] <= max_val:
+                    matched = 1
+                    succeed += 1
+                    if debug:
+                        print("succeed = ",succeed)
+                    # the predicted PV is removed from the original array to avoid associating 
+                    # one true PV to multiple predicted PVs
+                    # (this could happen for PVs with close z values)
+                    pred_PVs_loc = np.delete(pred_PVs_loc,[j])
+                    # Since a predicted PV and a true PV where matched, go to the next true PV 'i'
+                    reco_res = np.delete(reco_res,[j])
+                    break
+            # In case, no predicted PV could be associated with the true PV 'i'
+            # then it is assigned as a MT answer
+            if not matched:
+                missed += 1
+                if debug:
+                    print("missed = ",missed)
+                    
+        # the number of false positive predicted PVs is simply the difference between the original 
+        # number of predicted PVs and the number of successfully matched predicted PVs
+        false_pos = (len_pred_PVs_loc - succeed)
+        if debug:
+            print("false_pos = ",false_pos)
+
+    return succeed, missed, false_pos
+#####################################################################################
+    
